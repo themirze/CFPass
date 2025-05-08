@@ -1,6 +1,7 @@
 {
   "telegram": {
     "botToken": "7671909218:AAEHycHZZ9IHZU4Z5sslL96O5AKEQxnbM4Y",
-    "channelId": "-1002535082080"
+    "reportChannelId": "-1002679322546",
+    "appointmentChannelId": "-1002535082080"
   }
 }

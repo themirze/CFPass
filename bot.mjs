@@ -1,7 +1,18 @@
 import { connect } from "puppeteer-real-browser";
-import { sendMessage, getMessage } from "./modules/telegram.mjs";
+import { sendMessage } from "./modules/telegram.mjs";
 import { downloadCaptcha } from "./modules/captcha.mjs";
-import { fillAppointmentForm } from "./modules/appointment.mjs";
+import { fillAppointmentForm, monitorAvailability } from "./modules/appointment.mjs";
+import { TIMING } from "./config/timing.js";
+import { MESSAGES } from "./config/messages.js";
+import fs from "fs";
+import path from "path";
+import { fileURLToPath } from "url";
+
+const __dirname = path.dirname(fileURLToPath(import.meta.url));
+const IMG_FOLDER = path.join(__dirname, "img");
+
+let startTime = null;
+let lastUptimeMessage = 0;
 
 function getCurrentTime() {
   const now = new Date();
@@ -14,81 +25,99 @@ function getCurrentTime() {
   });
 }
 
-async function checkAlertClass(page) {
-  const availableDayInfo = await page.$("#availableDayInfo");
-  if (availableDayInfo) {
-    try {
-      const alertDiv = await availableDayInfo.$("div");
-      if (alertDiv) {
-        const alertClass = await alertDiv.evaluate((el) => el.getAttribute("class"));
-        if (alertClass && alertClass.includes("alert-info")) {
-          const message = `${getCurrentTime()} | ${getMessage("appointment_available")}`;
-          console.log(message);
-          await sendMessage(message);
-        } else {
-          console.log(`${getCurrentTime()} | ❌ Əlçatan tarix yoxdur.`);
-        }
-      }
-    } catch (error) {
-      console.log(`${getCurrentTime()} | ❌ Əlçatan tarix yoxdur.`);
-    }
-  } else {
-    console.log(`${getCurrentTime()} | ❌ Əlçatan tarix yoxdur.`);
+function getUptime() {
+  if (!startTime) return "";
+  const uptime = Date.now() - startTime;
+  const hours = Math.floor(uptime / (1000 * 60 * 60));
+  const minutes = Math.floor((uptime % (1000 * 60 * 60)) / (1000 * 60));
+  return `\n🕒 Çalışma Süresi: ${hours} saat ${minutes} dakika`;
+}
+
+async function sendUptimeIfNeeded() {
+  const now = Date.now();
+  if (now - lastUptimeMessage >= TIMING.UPTIME_MESSAGE_INTERVAL) {
+    await sendMessage(`${MESSAGES.COMMON.BOT_ACTIVE}${getUptime()}`);
+    lastUptimeMessage = now;
   }
 }
 
-async function keepAliveOnFormPage(page) {
-  console.log("🕒 Form səhifəsində 19 dəqiqə aktiv qalma rejimi başladı...");
-  const startTime = Date.now();
-  const personValues = ["1", "2"];
-  let currentIndex = 0;
-
-  while (Date.now() - startTime < 19 * 60 * 1000) {
-    try {
-      const personSelector = await page.$("#totalPerson");
-      if (personSelector) {
-        await personSelector.select(personValues[currentIndex]);
-        console.log(`🔁 Ərizəçi sayı dəyişdi: ${personValues[currentIndex]}`);
-        await new Promise((resolve) => setTimeout(resolve, 2000));
-
-        await checkAlertClass(page);
-        await new Promise((resolve) => setTimeout(resolve, 2000));
-
-        currentIndex = 1 - currentIndex;
-      } else {
-        console.log("❌ #totalPerson elementi tapılmadı.");
-        break;
+function cleanImgFolder() {
+  try {
+    if (fs.existsSync(IMG_FOLDER)) {
+      const files = fs.readdirSync(IMG_FOLDER);
+      for (const file of files) {
+        fs.unlinkSync(path.join(IMG_FOLDER, file));
       }
-    } catch (error) {
-      console.log(`⚠️ Ərizəçi sayını dəyişərkən xəta: ${error.message}`);
-      break;
+      console.log("✅ Captcha görüntüleri temizlendi");
     }
+  } catch (error) {
+    console.error("❌ Captcha görüntüleri temizlenirken hata:", error);
   }
 }
 
 async function checkAppointment(page) {
   try {
-    await new Promise((resolve) => setTimeout(resolve, 2000));
+    await new Promise((resolve) => setTimeout(resolve, TIMING.INITIAL_LOAD_DELAY));
 
     const captchaText = await downloadCaptcha(page);
     if (captchaText) {
+      cleanImgFolder();
       if (await fillAppointmentForm(page)) {
-        await new Promise((resolve) => setTimeout(resolve, 3000));
-        await keepAliveOnFormPage(page);
+        await new Promise((resolve) => setTimeout(resolve, TIMING.POST_FORM_DELAY));
+        const isAvailable = await monitorAvailability(page);
+        if (!isAvailable) {
+          return false;
+        }
       }
     } else {
-      await sendMessage(`${getCurrentTime()} | ${getMessage("captcha_failed")}`);
+      await sendMessage(MESSAGES.REPORT.CAPTCHA_FAILED);
     }
+    return true;
   } catch (error) {
-    const errorMessage = `${getCurrentTime()} | ⚠️ Xəta baş verdi: ${error.message}`;
-    console.log(errorMessage);
-    await sendMessage(errorMessage);
+    await sendMessage(MESSAGES.REPORT.MAIN_LOOP_ERROR.replace("{error}", error.message));
+    return false;
   }
+}
+
+async function retryCloudflare(page) {
+  let retryCount = 0;
+
+  while (retryCount < TIMING.MAX_CLOUDFLARE_RETRIES) {
+    try {
+      await page.goto("http://az-appointment.visametric.com/az", { waitUntil: "networkidle2" });
+      const cookies = await page.cookies();
+      const cfClearance = cookies.find((c) => c.name === "cf_clearance");
+
+      if (cfClearance) {
+        await sendMessage(MESSAGES.REPORT.CLOUDFLARE_SUCCESS);
+        return true;
+      } else {
+        retryCount++;
+        if (retryCount < TIMING.MAX_CLOUDFLARE_RETRIES) {
+          await sendMessage(MESSAGES.REPORT.CLOUDFLARE_RETRY.replace("{retryCount}", retryCount));
+          await new Promise((resolve) => setTimeout(resolve, TIMING.CLOUDFLARE_RETRY_DELAY));
+        }
+      }
+    } catch (error) {
+      retryCount++;
+      if (retryCount < TIMING.MAX_CLOUDFLARE_RETRIES) {
+        await sendMessage(
+          MESSAGES.REPORT.CLOUDFLARE_ERROR.replace("{error}", error.message).replace("{retryCount}", retryCount)
+        );
+        await new Promise((resolve) => setTimeout(resolve, TIMING.CLOUDFLARE_RETRY_DELAY));
+      }
+    }
+  }
+
+  await sendMessage(MESSAGES.REPORT.CLOUDFLARE_FAILED.replace("{maxRetries}", TIMING.MAX_CLOUDFLARE_RETRIES));
+  return false;
 }
 
 (async () => {
   try {
-    await sendMessage(`${getCurrentTime()} | ${getMessage("starting")}`);
+    startTime = Date.now();
+    lastUptimeMessage = startTime;
+    await sendMessage(MESSAGES.REPORT.STARTING);
 
     const { browser, page } = await connect({
       headless: false,
@@ -99,39 +128,22 @@ async function checkAppointment(page) {
 
     while (true) {
       try {
-        await page.goto("http://az-appointment.visametric.com/az", { waitUntil: "networkidle2" });
+        await sendUptimeIfNeeded();
 
-        console.log("📄 Bypassing Cloudflare...");
-        await sendMessage("📄 Cloudflare bypass ediliyor...");
-
-        await new Promise((resolve) => setTimeout(resolve, 20000));
-
-        const title = await page.title();
-        console.log("Sayfa Başlığı:", title);
-
-        const cookies = await page.cookies();
-        const cfClearance = cookies.find((c) => c.name === "cf_clearance");
-
-        if (cfClearance) {
-          console.log("✅ Cloudflare bypass edildi");
-          await sendMessage(getMessage("cloudflare_bypassed"));
-          await checkAppointment(page);
-        } else {
-          console.log("❌ Cloudflare bypass edilemedi");
-          await sendMessage(getMessage("cloudflare_failed"));
+        if (await retryCloudflare(page)) {
+          const shouldContinue = await checkAppointment(page);
+          if (!shouldContinue) {
+            continue;
+          }
         }
 
-        console.log(`\n${"=" * 50}`);
-        console.log(`Sonraki kontrol için 30 saniye bekleniyor... (${getCurrentTime()})`);
-        console.log(`${"=" * 50}\n`);
-        await new Promise((resolve) => setTimeout(resolve, 30000));
+        await new Promise((resolve) => setTimeout(resolve, TIMING.MAIN_LOOP_DELAY));
       } catch (error) {
-        console.log(`❌ Ana döngüde hata: ${error.message}`);
-        await new Promise((resolve) => setTimeout(resolve, 30000));
+        await sendMessage(MESSAGES.REPORT.MAIN_LOOP_ERROR.replace("{error}", error.message));
+        await new Promise((resolve) => setTimeout(resolve, TIMING.MAIN_LOOP_DELAY));
       }
     }
   } catch (error) {
-    console.error("❌ Beklenmeyen hata:", error);
-    await sendMessage(`${getCurrentTime()} | ${getMessage("error", { error: error.message })}`);
+    await sendMessage(MESSAGES.COMMON.ERROR.replace("{error}", error.message));
   }
 })();

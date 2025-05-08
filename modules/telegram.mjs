@@ -4,15 +4,18 @@ import axios from "axios";
 
 const TELEGRAM_API = `https://api.telegram.org/bot${config.telegram.botToken}`;
 
-export async function sendMessage(message) {
+export async function sendMessage(message, isAppointment = false) {
   try {
+    const channelId = isAppointment ? config.telegram.appointmentChannelId : config.telegram.reportChannelId;
+
     console.log("Sending message to Telegram...");
     console.log("Bot Token:", config.telegram.botToken);
-    console.log("Channel ID:", config.telegram.channelId);
+    console.log("Channel ID:", channelId);
     console.log("Message:", message);
+    console.log("Message Type:", isAppointment ? "Appointment" : "Report");
 
     const response = await axios.post(`${TELEGRAM_API}/sendMessage`, {
-      chat_id: config.telegram.channelId,
+      chat_id: channelId,
       text: message,
       parse_mode: "HTML",
       disable_web_page_preview: true,
